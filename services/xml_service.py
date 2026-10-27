@@ -33,8 +33,8 @@ def _format_value(value: Any) -> str:
 
     Rules:
     - None / NaN  → empty string (the element is still present)
-    - datetime    → DD-MON-YYYY (Oracle-compatible)
-    - date        → DD-MON-YYYY
+    - datetime    → DDMMYYYY
+    - date        → DDMMYYYY
     - Decimal     → plain decimal string (no scientific notation)
     - float       → fixed-point with up to 2 decimal places (trailing zeros stripped)
     - int         → plain integer string
@@ -45,9 +45,9 @@ def _format_value(value: Any) -> str:
     if isinstance(value, float) and pd.isna(value):
         return ""
     if isinstance(value, datetime):
-        return value.strftime("%d-%b-%Y").upper()
+        return value.strftime("%d%m%Y")
     if isinstance(value, date):
-        return value.strftime("%d-%b-%Y").upper()
+        return value.strftime("%d%m%Y")
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, float):
@@ -89,15 +89,9 @@ def generate_xml(df: pd.DataFrame) -> str:
     # Build an upper-case lookup from actual columns
     col_upper = {c.upper(): c for c in df.columns}
 
-    # Pre-check: which mapped source columns are actually present?
-    available_mappings: list[tuple[str, str]] = []
-    missing_sources: list[str] = []
-
-    for src_upper, xml_name in COLUMN_TO_XML_MAP.items():
-        if src_upper in col_upper:
-            available_mappings.append((col_upper[src_upper], xml_name))
-        else:
-            missing_sources.append(src_upper)
+    missing_sources = [
+        src_upper for src_upper in COLUMN_TO_XML_MAP if src_upper not in col_upper
+    ]
 
     if missing_sources:
         logger.warning(
@@ -105,7 +99,7 @@ def generate_xml(df: pd.DataFrame) -> str:
             missing_sources,
         )
 
-    if not available_mappings:
+    if len(missing_sources) == len(COLUMN_TO_XML_MAP):
         raise ValueError(
             "No cursor columns could be mapped to XML elements. "
             "Please verify the column mapping in refinance_service.py."
@@ -114,17 +108,12 @@ def generate_xml(df: pd.DataFrame) -> str:
     # --- Build the tree -------------------------------------------------------
     root = Element("TRANSACTION_INFO")
 
-    for _, row in df.iterrows():
-        detail = SubElement(root, "TRANS_DETAILS")
-        for actual_col, xml_name in available_mappings:
+    for record_number, (_, row) in enumerate(df.iterrows(), start=1):
+        detail = SubElement(root, "TRANS_DETAILS", {"record_number": str(record_number)})
+        for src_upper, xml_name in COLUMN_TO_XML_MAP.items():
             elem = SubElement(detail, xml_name)
-            elem.text = _format_value(row.get(actual_col))
-        # Also add empty elements for missing source columns so the
-        # receiving procedure gets every expected field.
-        for src_upper in missing_sources:
-            xml_name = COLUMN_TO_XML_MAP[src_upper]
-            elem = SubElement(detail, xml_name)
-            elem.text = ""
+            actual_col = col_upper.get(src_upper)
+            elem.text = _format_value(row.get(actual_col)) if actual_col else ""
 
     indent(root, space="    ")
 

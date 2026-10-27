@@ -36,12 +36,7 @@ logger = logging.getLogger("refinance_app.services.refinance")
 # ---------------------------------------------------------------------------
 
 COLUMN_TO_XML_MAP: dict[str, str] = {
-    "BRANCH_ID":              "Pbranch_id",
-    "ACCOUNT_NUMBER":         "Paccount_number",
     "CUSTOMER_ID":            "Pcustomer_id",
-    "GROUP_ID":               "Pgroup_id",
-    "ACCOUNT_TITLE":          "Paccount_title",
-    "BORROWER_NAME":          "Pborrower_name",
     "BORROWER_PHONE":         "PBorrower_Phone",
     "BORROWER_NID":           "PBorrower_NID",
     "BUSINESS_ADDRESS":       "PBusiness_Address",
@@ -50,7 +45,6 @@ COLUMN_TO_XML_MAP: dict[str, str] = {
     "SUBSECTOR":              "Psubsector",
     "PRODUCT_OF_ENTERPRISE":  "Pproduct_of_enterprise",
     "ESTABLISHED_YEAR":       "Pestablished_year",
-    "ESTABLISHED_STRUCTURE":  "Pestablished_structure",
     "OWNERSHIP_GENDER":       "POwnership_gender",
     "TYPE_OF_SME":            "Ptype_of_sme",
     "TRADE_LICENSE_NO":       "Ptrade_license_no",
@@ -62,14 +56,21 @@ COLUMN_TO_XML_MAP: dict[str, str] = {
     "NO_OF_EMPLOYEE":         "Pno_of_employee",
     "NO_OF_EMPLOYEE_M":       "Pno_of_employee_m",
     "NO_OF_EMPLOYEE_F":       "Pno_of_employee_f",
-    "LOAN_AMOUNT":            "Ploan_amount",
     "INTEREST_RATE":          "Pinterest_Rate",
-    "OPEN_DATE":              "Popen_date",
     "DISBURSEMENT_DATE":      "PDisbursement_date",
     "GRACE_PERIOD":           "PGrace_Period",
+    "LOAN_PURPOSE":           "PLoan_purpose",
+    "REMARKS":                "PRemarks",
+    "BRANCH_ID":              "Pbranch_id",
+    "ACCOUNT_NUMBER":         "Paccount_number",
+    "GROUP_ID":               "Pgroup_id",
+    "ACCOUNT_TITLE":          "Paccount_title",
+    "BORROWER_NAME":          "Pborrower_name",
+    "ESTABLISHED_STRUCTURE":  "Pestablished_structure",
+    "LOAN_AMOUNT":            "Ploan_amount",
+    "OPEN_DATE":              "Popen_date",
     "EXPIRY_DATE":            "Pexpiry_date",
     "TENURE":                 "Ptenure",
-    "LOAN_PURPOSE":           "PLoan_purpose",
     "LOAN_SCHEME":            "Ploan_scheme",
     "SCHEME_SHORT_CODE":      "Pscheme_short_code",
     "FUND_CATEGORY":          "Pfund_category",
@@ -79,7 +80,6 @@ COLUMN_TO_XML_MAP: dict[str, str] = {
     "TOTAL_INSTALLMENT":      "Ptotal_installment",
     "CL_STATUS":              "Pcl_status",
     "REPAY_DATE":             "Prepay_date",
-    "REMARKS":                "PRemarks",
 }
 
 
@@ -170,6 +170,138 @@ def get_refinance_details(branch_id: str | None = None) -> pd.DataFrame:
         ) from exc
 
 
+def get_pending_batches(batch_no: str | None = None) -> pd.DataFrame:
+    """Fetch pending batch records using the package's optional batch filter."""
+    batch_no = batch_no.strip() if batch_no and batch_no.strip() else None
+
+    try:
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                batch_no_var = cur.var(
+                    oracledb.DB_TYPE_NVARCHAR,
+                    size=max(1, len(batch_no or "")),
+                )
+                batch_no_var.setvalue(0, batch_no)
+                result_cursor_var = cur.var(oracledb.CURSOR)
+                cur.execute(
+                    """
+                    BEGIN
+                        pkg_mgbl_refinance.get_upapproved_batch(
+                            pbatch_no       => :pbatch_no,
+                            presult_set_cur => :presult_set_cur
+                        );
+                    END;
+                    """,
+                    {
+                        "pbatch_no": batch_no_var,
+                        "presult_set_cur": result_cursor_var,
+                    },
+                )
+                result_cursor = result_cursor_var.getvalue()
+                if result_cursor is None:
+                    logger.info(
+                        "GET_UPAPPROVED_BATCH returned a NULL cursor for batch %s.",
+                        batch_no,
+                    )
+                    return pd.DataFrame()
+
+                try:
+                    columns = (
+                        [column[0] for column in result_cursor.description]
+                        if result_cursor.description
+                        else []
+                    )
+                    rows = result_cursor.fetchall()
+                finally:
+                    result_cursor.close()
+
+                result = pd.DataFrame(rows, columns=columns)
+                logger.info(
+                    "Retrieved %d pending batch records for batch %s.",
+                    len(result),
+                    batch_no,
+                )
+                return result
+    except DatabaseError:
+        raise
+    except oracledb.Error as exc:
+        logger.error("Procedure GET_UPAPPROVED_BATCH failed: %s", exc, exc_info=True)
+        raise DatabaseError(
+            "Unable to retrieve pending batches. Please try again or contact the system administrator."
+        ) from exc
+    except Exception as exc:
+        logger.error("Unexpected pending batch retrieval error: %s", exc, exc_info=True)
+        raise DatabaseError(
+            "Unable to retrieve pending batches. Please try again or contact the system administrator."
+        ) from exc
+
+
+def get_batch_details(batch_no: str | None = None) -> pd.DataFrame:
+    """Fetch batch details using the package's optional batch filter."""
+    batch_no = batch_no.strip() if batch_no and batch_no.strip() else None
+
+    try:
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                batch_no_var = cur.var(
+                    oracledb.DB_TYPE_NVARCHAR,
+                    size=max(1, len(batch_no or "")),
+                )
+                batch_no_var.setvalue(0, batch_no)
+                result_cursor_var = cur.var(oracledb.CURSOR)
+                cur.execute(
+                    """
+                    BEGIN
+                        pkg_mgbl_refinance.get_details_by_batch(
+                            Pbatch_no       => :Pbatch_no,
+                            Presult_set_cur => :Presult_set_cur
+                        );
+                    END;
+                    """,
+                    {
+                        "Pbatch_no": batch_no_var,
+                        "Presult_set_cur": result_cursor_var,
+                    },
+                )
+                result_cursor = result_cursor_var.getvalue()
+                if result_cursor is None:
+                    logger.info(
+                        "GET_DETAILS_BY_BATCH returned a NULL cursor for batch %s.",
+                        batch_no,
+                    )
+                    return pd.DataFrame()
+
+                try:
+                    columns = (
+                        [column[0] for column in result_cursor.description]
+                        if result_cursor.description
+                        else []
+                    )
+                    rows = result_cursor.fetchall()
+                finally:
+                    result_cursor.close()
+
+                result = pd.DataFrame(rows, columns=columns)
+                logger.info(
+                    "Retrieved %d batch detail records for batch %s.",
+                    len(result),
+                    batch_no,
+                )
+                return result
+    except DatabaseError:
+        raise
+    except oracledb.Error as exc:
+        logger.error("Procedure GET_DETAILS_BY_BATCH failed: %s", exc, exc_info=True)
+        raise DatabaseError(
+            "Unable to retrieve batch details. Please try again or contact the system administrator."
+        ) from exc
+    except Exception as exc:
+        logger.error("Unexpected batch detail retrieval error: %s", exc, exc_info=True)
+        raise DatabaseError(
+            "Unable to retrieve batch details. Please try again or contact the system administrator."
+        ) from exc
+
+
 def validate_column_mapping(df: pd.DataFrame) -> tuple[list[str], list[str]]:
     """
     Check whether every expected source column exists in the DataFrame.
@@ -209,6 +341,71 @@ class SubmissionResult:
     batch_number: Optional[str] = None
     timestamp: Optional[datetime] = None
     record_count: int = 0
+
+
+class BatchNumberMissingError(Exception):
+    """Raised when batch generation completes without an output batch number."""
+
+
+def generate_batch_number(
+    total_loan_no: str | None = None,
+    create_by: str | None = None,
+) -> str:
+    """Generate and persist a refinance batch reference through Oracle."""
+    try:
+        with managed_connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    total_loan_no_var = cur.var(
+                        oracledb.DB_TYPE_NVARCHAR,
+                        size=max(1, len(total_loan_no or "")),
+                    )
+                    total_loan_no_var.setvalue(0, total_loan_no)
+                    create_by_var = cur.var(
+                        oracledb.DB_TYPE_NVARCHAR,
+                        size=max(1, len(create_by or "")),
+                    )
+                    create_by_var.setvalue(0, create_by)
+                    batch_number_var = cur.var(oracledb.DB_TYPE_NVARCHAR, size=100)
+                    cur.execute(
+                        """
+                        BEGIN
+                            pkg_mgbl_refinance.generate_batch_number(
+                                ptotal_loan_no => :ptotal_loan_no,
+                                pcreate_by     => :pcreate_by,
+                                pbatch_no      => :pbatch_no
+                            );
+                        END;
+                        """,
+                        {
+                            "ptotal_loan_no": total_loan_no_var,
+                            "pcreate_by": create_by_var,
+                            "pbatch_no": batch_number_var,
+                        },
+                    )
+                    batch_number = batch_number_var.getvalue()
+
+                if batch_number is None or not str(batch_number).strip():
+                    conn.rollback()
+                    raise BatchNumberMissingError(
+                        "Batch generation completed, but no batch number was returned. "
+                        "Please verify the database procedure."
+                    )
+
+                conn.commit()
+                return str(batch_number).strip()
+            except BatchNumberMissingError:
+                raise
+            except Exception:
+                conn.rollback()
+                raise
+    except (DatabaseError, BatchNumberMissingError):
+        raise
+    except Exception as exc:
+        logger.error("Batch number generation failed: %s", exc, exc_info=True)
+        raise DatabaseError(
+            "Unable to generate the batch. Please contact the system administrator if the problem persists."
+        ) from exc
 
 
 def submit_refinance_batch(

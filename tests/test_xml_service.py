@@ -31,7 +31,7 @@ class TestFormatValue:
 
     def test_datetime(self):
         dt = datetime(2024, 3, 15, 10, 30, 0)
-        assert _format_value(dt) == "15-MAR-2024"
+        assert _format_value(dt) == "15032024"
 
     def test_integer(self):
         assert _format_value(42) == "42"
@@ -82,8 +82,8 @@ class TestGenerateXml:
         xml = generate_xml(sample_df)
         root = fromstring(xml)
         detail = root.find("TRANS_DETAILS")
-        child_tags = {child.tag for child in detail}
-        expected_tags = set(COLUMN_TO_XML_MAP.values())
+        child_tags = [child.tag for child in detail]
+        expected_tags = list(COLUMN_TO_XML_MAP.values())
         assert child_tags == expected_tags
 
     def test_null_values_produce_empty_elements(self, null_heavy_df):
@@ -124,7 +124,20 @@ class TestGenerateXml:
         root = fromstring(xml)
         detail = root.find("TRANS_DETAILS")
         open_date = detail.find("Popen_date")
-        assert open_date.text == "15-JAN-2024"
+        assert open_date.text == "15012024"
+
+    def test_each_record_has_the_same_ordered_fields_and_its_own_values(self, multi_row_df):
+        root = fromstring(generate_xml(multi_row_df))
+        details = root.findall("TRANS_DETAILS")
+        expected_tags = list(COLUMN_TO_XML_MAP.values())
+
+        assert len(details) == len(multi_row_df)
+        assert [detail.get("record_number") for detail in details] == ["1", "2", "3"]
+        for detail in details:
+            assert [child.tag for child in detail] == expected_tags
+        assert [detail.findtext("Paccount_number") for detail in details] == [
+            str(value) for value in multi_row_df["ACCOUNT_NUMBER"]
+        ]
 
     def test_numeric_formatting(self, sample_df):
         xml = generate_xml(sample_df)
