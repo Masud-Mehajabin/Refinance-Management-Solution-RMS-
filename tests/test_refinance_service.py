@@ -19,11 +19,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from services.refinance_service import (
     BatchNumberMissingError,
+    SubmissionOutcomeUncertainError,
     generate_batch_number,
     get_batch_details,
     get_pending_batches,
+    get_refinance_batch_numbers,
     get_refinance_details,
     submit_refinance_batch,
+    tag_batch_reference,
     SubmissionResult,
 )
 from database import DatabaseError
@@ -198,6 +201,42 @@ class TestGetPendingBatches:
         assert "sensitive details" not in str(exc_info.value)
 
 
+class TestGetRefinanceBatchNumbers:
+    @patch("services.refinance_service.managed_connection")
+    def test_returns_distinct_batch_numbers_and_ignores_null_or_blank_values(
+        self, mock_conn_ctx
+    ):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.fetchall.return_value = [("0012",), (None,), ("  ",), (13,)]
+        mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert get_refinance_batch_numbers() == ["0012", "13"]
+
+        sql = mock_cursor.execute.call_args.args[0]
+        assert "SELECT DISTINCT t.BATCH_NO" in sql
+        assert "FROM MGBL_REFINANCE_MASTER t" in sql
+        assert "WHERE t.BATCH_NO IS NOT NULL" in sql
+
+    @patch("services.refinance_service.managed_connection")
+    def test_database_error_is_wrapped_safely(self, mock_conn_ctx):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cursor.execute.side_effect = oracledb.DatabaseError("sensitive details")
+
+        with pytest.raises(DatabaseError, match="Unable to retrieve batch numbers") as exc_info:
+            get_refinance_batch_numbers()
+
+        assert "sensitive details" not in str(exc_info.value)
+
+
 class TestGetBatchDetails:
     @pytest.mark.parametrize(
         ("batch_no", "expected_batch_no"),
@@ -300,11 +339,12 @@ class TestSubmitRefinanceBatch:
 
         # Simulate OUT parameters
         mock_msg_var = MagicMock()
-        mock_msg_var.getvalue.return_value = "Batch created successfully"
+        mock_msg_var.getvalue.return_value = "000 - Successfully inserted 1 record(s)"
         mock_batch_var = MagicMock()
         mock_batch_var.getvalue.return_value = "BATCH-20240315-001"
+        mock_xml_var = MagicMock()
 
-        mock_cursor.var.side_effect = [mock_msg_var, mock_batch_var]
+        mock_cursor.var.side_effect = [mock_xml_var, mock_msg_var, mock_batch_var]
 
         result = submit_refinance_batch(
             xml_data="<TRANSACTION_INFO><TRANS_DETAILS></TRANS_DETAILS></TRANSACTION_INFO>",
@@ -318,6 +358,18 @@ class TestSubmitRefinanceBatch:
         assert result.success is True
         assert result.batch_number == "BATCH-20240315-001"
         assert result.record_count == 1
+        mock_xml_var.setvalue.assert_called_once_with(
+            0, "<TRANSACTION_INFO><TRANS_DETAILS></TRANS_DETAILS></TRANSACTION_INFO>"
+        )
+        bind_values = mock_cursor.execute.call_args.args[1]
+        assert bind_values["pxml_data"] is mock_xml_var
+        assert bind_values["pmake_by"] == "test_user"
+        assert bind_values["pmake_date"] == datetime(2024, 3, 15)
+        assert bind_values["pauthorize_by"] == "auth_user"
+        assert bind_values["pauthorize_date"] == datetime(2024, 3, 15)
+        assert "pkg_mgbl_refinance.refinance_master_info_i" in mock_cursor.execute.call_args.args[0]
+        mock_conn.commit.assert_called_once_with()
+        mock_conn.rollback.assert_not_called()
 
     @patch("services.refinance_service.managed_connection")
     def test_procedure_error_message(self, mock_conn_ctx):
@@ -334,7 +386,7 @@ class TestSubmitRefinanceBatch:
         mock_batch_var = MagicMock()
         mock_batch_var.getvalue.return_value = ""
 
-        mock_cursor.var.side_effect = [mock_msg_var, mock_batch_var]
+        mock_cursor.var.side_effect = [MagicMock(), mock_msg_var, mock_batch_var]
 
         result = submit_refinance_batch(
             xml_data="<TRANSACTION_INFO><TRANS_DETAILS></TRANS_DETAILS></TRANSACTION_INFO>",
@@ -346,6 +398,8 @@ class TestSubmitRefinanceBatch:
 
         assert result.success is False
         assert "error" in result.message.lower()
+        mock_conn.rollback.assert_called_once_with()
+        mock_conn.commit.assert_not_called()
 
     @patch("services.refinance_service.managed_connection")
     def test_missing_batch_number(self, mock_conn_ctx):
@@ -362,7 +416,7 @@ class TestSubmitRefinanceBatch:
         mock_batch_var = MagicMock()
         mock_batch_var.getvalue.return_value = None
 
-        mock_cursor.var.side_effect = [mock_msg_var, mock_batch_var]
+        mock_cursor.var.side_effect = [MagicMock(), mock_msg_var, mock_batch_var]
 
         result = submit_refinance_batch(
             xml_data="<TRANSACTION_INFO><TRANS_DETAILS></TRANS_DETAILS></TRANSACTION_INFO>",
@@ -375,6 +429,90 @@ class TestSubmitRefinanceBatch:
         # No batch number → treated as unsuccessful
         assert result.success is False
         assert result.batch_number is None
+        mock_conn.rollback.assert_called_once_with()
+        mock_conn.commit.assert_not_called()
+
+    @patch("services.refinance_service.managed_connection")
+    def test_batch_number_without_success_status_rolls_back(self, mock_conn_ctx):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        mock_msg_var = MagicMock()
+        mock_msg_var.getvalue.return_value = "No transaction details found in XML"
+        mock_batch_var = MagicMock()
+        mock_batch_var.getvalue.return_value = "12"
+        mock_cursor.var.side_effect = [MagicMock(), mock_msg_var, mock_batch_var]
+
+        result = submit_refinance_batch(
+            xml_data="<TRANSACTION_INFO><TRANS_DETAILS></TRANS_DETAILS></TRANSACTION_INFO>",
+            make_by="test_user",
+            make_date=datetime(2024, 3, 15),
+            authorize_by="auth_user",
+            authorize_date=datetime(2024, 3, 15),
+            record_count=1,
+        )
+
+        assert result.success is False
+        assert result.batch_number == "12"
+        mock_conn.rollback.assert_called_once_with()
+        mock_conn.commit.assert_not_called()
+
+    @patch("services.refinance_service.managed_connection")
+    def test_oracle_exception_rolls_back_and_raises_safe_error(self, mock_conn_ctx):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cursor.execute.side_effect = oracledb.DatabaseError("ORA-01400: sensitive database detail")
+
+        with pytest.raises(DatabaseError, match="transaction was rolled back") as exc_info:
+            submit_refinance_batch(
+                xml_data="<TRANSACTION_INFO><TRANS_DETAILS></TRANS_DETAILS></TRANSACTION_INFO>",
+                make_by="test_user",
+                make_date=datetime(2024, 3, 15),
+                authorize_by="auth_user",
+                authorize_date=datetime(2024, 3, 15),
+                record_count=1,
+            )
+
+        assert "sensitive database detail" not in str(exc_info.value)
+        assert "ORA-01400" in str(exc_info.value)
+        mock_conn.rollback.assert_called_once_with()
+        mock_conn.commit.assert_not_called()
+
+    @patch("services.refinance_service.managed_connection")
+    def test_commit_exception_is_marked_uncertain(self, mock_conn_ctx):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_msg_var = MagicMock()
+        mock_msg_var.getvalue.return_value = "000 - Successfully inserted 1 record(s)"
+        mock_batch_var = MagicMock()
+        mock_batch_var.getvalue.return_value = "12"
+        mock_cursor.var.side_effect = [MagicMock(), mock_msg_var, mock_batch_var]
+        mock_conn.commit.side_effect = oracledb.DatabaseError("commit connection lost")
+
+        with pytest.raises(SubmissionOutcomeUncertainError, match="commit outcome is uncertain"):
+            submit_refinance_batch(
+                xml_data="<TRANSACTION_INFO><TRANS_DETAILS></TRANS_DETAILS></TRANSACTION_INFO>",
+                make_by="maker",
+                make_date=datetime(2024, 3, 15),
+                authorize_by="authorizer",
+                authorize_date=datetime(2024, 3, 15),
+                record_count=1,
+            )
+
+        mock_conn.commit.assert_called_once_with()
+        mock_conn.rollback.assert_called_once_with()
 
 
 class TestGenerateBatchNumber:
@@ -434,6 +572,7 @@ class TestGenerateBatchNumber:
         mock_conn.commit.assert_not_called()
         mock_conn.rollback.assert_called_once_with()
 
+
     @patch("services.refinance_service.managed_connection")
     def test_oracle_error_rolls_back_and_returns_safe_database_error(self, mock_conn_ctx):
         mock_conn = MagicMock()
@@ -446,6 +585,63 @@ class TestGenerateBatchNumber:
 
         with pytest.raises(DatabaseError, match="Unable to generate the batch") as exc_info:
             generate_batch_number()
+
+        assert "sensitive database detail" not in str(exc_info.value)
+        mock_conn.commit.assert_not_called()
+        mock_conn.rollback.assert_called_once_with()
+
+
+class TestTagBatchReference:
+    @patch("services.refinance_service.managed_connection")
+    def test_updates_only_reference_for_batch_and_commits_row_count(self, mock_conn_ctx):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 12
+        mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert tag_batch_reference("0012", "BB-REF-2026-001") == 12
+
+        sql, binds = mock_cursor.execute.call_args.args
+        assert "UPDATE MGBL_REFINANCE_MASTER t" in sql
+        assert "SET t.BB_REFERENCE_ID = :P_REFERENCE_NO" in sql
+        assert "WHERE t.BATCH_NO = :P_BATCH_NO" in sql
+        assert binds == {
+            "P_REFERENCE_NO": "BB-REF-2026-001",
+            "P_BATCH_NO": "0012",
+        }
+        mock_conn.commit.assert_called_once_with()
+        mock_conn.rollback.assert_not_called()
+
+    @patch("services.refinance_service.managed_connection")
+    def test_zero_updated_rows_roll_back_and_return_zero(self, mock_conn_ctx):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.rowcount = 0
+        mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+
+        assert tag_batch_reference("missing", "BB-REF") == 0
+
+        mock_conn.commit.assert_not_called()
+        mock_conn.rollback.assert_called_once_with()
+
+    @patch("services.refinance_service.managed_connection")
+    def test_update_error_rolls_back_and_returns_safe_database_error(self, mock_conn_ctx):
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_conn_ctx.return_value.__enter__ = MagicMock(return_value=mock_conn)
+        mock_conn_ctx.return_value.__exit__ = MagicMock(return_value=False)
+        mock_conn.cursor.return_value.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+        mock_cursor.execute.side_effect = oracledb.DatabaseError("sensitive database detail")
+
+        with pytest.raises(DatabaseError, match="Unable to assign the reference number") as exc_info:
+            tag_batch_reference("12", "BB-REF")
 
         assert "sensitive database detail" not in str(exc_info.value)
         mock_conn.commit.assert_not_called()

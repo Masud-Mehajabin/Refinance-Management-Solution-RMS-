@@ -6,12 +6,10 @@ Run with ``uvicorn app:app --host 127.0.0.1 --port 8000`` from this directory.
 from __future__ import annotations
 
 import json
-import hashlib
-import secrets
 import threading
 import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime, time as datetime_time
 from pathlib import Path
 from typing import Any
 
@@ -24,24 +22,24 @@ from pydantic import BaseModel, Field
 from config import (
     ALLOW_BATCH_SUBMISSION,
     APP_ENV,
-    APPROVER_PASSWORD,
-    APPROVER_USERNAME,
-    APP_USER,
     logger,
 )
 from database import DatabaseError, test_connection
 from services.excel_service import generate_excel, get_excel_filename
 from services.refinance_service import (
     BatchNumberMissingError,
+    SubmissionOutcomeUncertainError,
     SubmissionResult,
     generate_batch_number,
     get_batch_details,
     get_pending_batches,
+    get_refinance_batch_numbers,
     get_refinance_details,
     submit_refinance_batch,
+    tag_batch_reference,
     validate_column_mapping,
 )
-from services.xml_service import generate_xml, validate_xml
+from services.xml_service import generate_xml, missing_required_xml_values, validate_xml
 
 app = FastAPI(
     title="Refinance Management API",
@@ -67,14 +65,9 @@ MAX_SNAPSHOTS = 100
 _snapshot_lock = threading.Lock()
 _snapshots: dict[str, dict[str, Any]] = {}
 _submission_lock = threading.Lock()
-_submission_states: dict[str, str] = {}
+_submission_record_states: dict[tuple[str, str], tuple[str, float]] = {}
 _tag_batch_lock = threading.Lock()
-
-
-class BatchSubmissionRequest(BaseModel):
-    confirmed: bool = False
-    authorizer_username: str = Field(min_length=1, max_length=128)
-    authorizer_password: str = Field(min_length=1, max_length=256)
+_tag_reference_lock = threading.Lock()
 
 
 class ExcelExportRequest(BaseModel):
@@ -90,13 +83,21 @@ class SelectionRequest(BaseModel):
 
 class SelectedBatchRequest(SelectionRequest):
     confirmed: bool = False
-    authorizer_username: str = Field(min_length=1, max_length=128)
-    authorizer_password: str = Field(min_length=1, max_length=256)
+    pxml_data: str = Field(min_length=1)
+    pmake_by: str | None = Field(default=None, max_length=128)
+    pmake_date: date | None = None
+    pauthorize_by: str | None = Field(default=None, max_length=128)
+    pauthorize_date: date | None = None
 
 
 class TagBatchRequest(BaseModel):
     total_loan_no: str | None = Field(default=None, max_length=4000)
     create_by: str | None = Field(default=None, max_length=4000)
+
+
+class TagReferenceRequest(BaseModel):
+    batch_no: str = Field(min_length=1, max_length=128)
+    reference_no: str = Field(min_length=1, max_length=128)
 
 
 class PendingBatchesRequest(BaseModel):
@@ -107,9 +108,14 @@ class BatchDetailsRequest(BaseModel):
     batch_no: str | None = None
 
 
-def _selected_xml(request: SelectionRequest) -> tuple[pd.DataFrame, str, dict[str, Any]]:
+def _selected_xml(
+    request: SelectionRequest,
+) -> tuple[pd.DataFrame, str, dict[str, Any]]:
     selected_df, snapshot = _selected_dataframe(request)
-    xml_data = generate_xml(selected_df)
+    try:
+        xml_data = generate_xml(selected_df)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Unable to generate submission XML: {exc}") from exc
     is_valid, message = validate_xml(xml_data)
     if not is_valid:
         raise HTTPException(status_code=422, detail=f"XML validation failed: {message}")
@@ -132,23 +138,14 @@ def _branch_label(branch_id: str | None) -> str:
     return branch_id.strip() if branch_id and branch_id.strip() else "ALL BRANCHES"
 
 
-def _validate_batch_authorization(confirmed: bool, username: str, password: str) -> str:
-    if not ALLOW_BATCH_SUBMISSION or not APPROVER_USERNAME or not APPROVER_PASSWORD:
+def _validate_batch_submission(confirmed: bool) -> None:
+    if not ALLOW_BATCH_SUBMISSION:
         raise HTTPException(
             status_code=403,
-            detail="Batch submission is disabled. Enable it only after the bank's authorization workflow is configured.",
+            detail="Batch submission is disabled.",
         )
     if not confirmed:
         raise HTTPException(status_code=400, detail="Explicit confirmation is required before submission.")
-    authorizer = username.strip()
-    if not (
-        secrets.compare_digest(authorizer, APPROVER_USERNAME)
-        and secrets.compare_digest(password, APPROVER_PASSWORD)
-    ):
-        raise HTTPException(status_code=401, detail="Invalid authorizer credentials.")
-    if secrets.compare_digest(authorizer.casefold(), APP_USER.casefold()):
-        raise HTTPException(status_code=400, detail="Maker and authorizer must be different users.")
-    return authorizer
 
 
 def _new_snapshot(df: pd.DataFrame, branch_id: str | None) -> tuple[str, list[dict[str, Any]]]:
@@ -209,6 +206,27 @@ def _records_response(branch_id: str | None) -> dict:
     df = _load_branch(branch_id)
     _, missing_columns = validate_column_mapping(df)
     snapshot_id, records = _new_snapshot(df, branch_id)
+    xml_error = None
+    try:
+        loaded_xml = generate_xml(df) if not df.empty else ""
+        if loaded_xml:
+            is_valid, validation_message = validate_xml(loaded_xml)
+            if not is_valid:
+                logger.error(
+                    "Generated loaded-record XML failed validation for snapshot %s: %s",
+                    snapshot_id,
+                    validation_message,
+                )
+                loaded_xml = ""
+                xml_error = "Unable to validate XML for the loaded refinance data."
+    except ValueError:
+        logger.warning(
+            "Unable to generate XML for loaded refinance data (snapshot %s).",
+            snapshot_id,
+            exc_info=True,
+        )
+        loaded_xml = ""
+        xml_error = "Unable to generate XML for the loaded refinance data."
     return {
         "branch_id": _branch_label(branch_id),
         "snapshot_id": snapshot_id,
@@ -216,6 +234,8 @@ def _records_response(branch_id: str | None) -> dict:
         "record_count": len(df),
         "columns": list(df.columns),
         "missing_xml_columns": missing_columns,
+        "xml_data": loaded_xml,
+        "xml_error": xml_error,
         "records": records,
     }
 
@@ -276,48 +296,92 @@ def download_selected_xml(request: SelectionRequest) -> Response:
 
 
 def _submit_selected_batch(request: SelectedBatchRequest) -> dict:
-    authorizer = _validate_batch_authorization(
-        request.confirmed,
-        request.authorizer_username,
-        request.authorizer_password,
-    )
-    maker = APP_USER
+    _validate_batch_submission(request.confirmed)
 
+    if not request.pxml_data.strip():
+        raise HTTPException(status_code=422, detail="XML Data is required.")
+    is_valid, validation_message = validate_xml(request.pxml_data)
+    if not is_valid:
+        raise HTTPException(
+            status_code=422,
+            detail=f"XML Data is invalid: {validation_message}",
+        )
     selected_df, xml_data, snapshot = _selected_xml(request)
-    fingerprint = hashlib.sha256(
-        (request.snapshot_id + "\0" + "\0".join(sorted(request.selected_ids))).encode("utf-8")
-    ).hexdigest()
+    if request.pxml_data != xml_data:
+        raise HTTPException(
+            status_code=422,
+            detail="XML Data does not match the selected records. Close the dialog and prepare it again.",
+        )
+    missing_required_values = missing_required_xml_values(selected_df)
+    if missing_required_values:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Selected records have empty values for required database fields: "
+                f"{', '.join(missing_required_values)}. Correct the source data and reload."
+            ),
+        )
+    submission_keys = [(request.snapshot_id, record_id) for record_id in request.selected_ids]
     with _submission_lock:
-        submission_state = _submission_states.get(fingerprint)
-        if submission_state:
+        now_monotonic = time.monotonic()
+        expired_keys = [
+            key
+            for key, (state, updated_at) in _submission_record_states.items()
+            if state != "in_progress" and now_monotonic - updated_at > SNAPSHOT_TTL_SECONDS
+        ]
+        for key in expired_keys:
+            _submission_record_states.pop(key, None)
+        if any(key in _submission_record_states for key in submission_keys):
             raise HTTPException(
                 status_code=409,
-                detail="This exact selection has already been submitted or is in progress. Reload records before retrying.",
+                detail="One or more selected records have already been submitted or are in progress. Reload records before retrying.",
             )
-        _submission_states[fingerprint] = "in_progress"
+        for key in submission_keys:
+            _submission_record_states[key] = ("in_progress", now_monotonic)
 
-    now = datetime.now()
+    make_date = datetime.combine(request.pmake_date, datetime_time.min) if request.pmake_date else None
+    authorize_date = (
+        datetime.combine(request.pauthorize_date, datetime_time.min)
+        if request.pauthorize_date
+        else None
+    )
     try:
         result: SubmissionResult = submit_refinance_batch(
-            xml_data=xml_data,
-            make_by=maker,
-            make_date=now,
-            authorize_by=authorizer,
-            authorize_date=now,
+            xml_data=request.pxml_data,
+            make_by=request.pmake_by.strip() or None if request.pmake_by else None,
+            make_date=make_date,
+            authorize_by=request.pauthorize_by.strip() or None if request.pauthorize_by else None,
+            authorize_date=authorize_date,
             record_count=len(selected_df),
         )
+    except SubmissionOutcomeUncertainError as exc:
+        with _submission_lock:
+            for key in submission_keys:
+                _submission_record_states[key] = ("uncertain", time.monotonic())
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     except DatabaseError as exc:
         with _submission_lock:
-            _submission_states[fingerprint] = "uncertain"
+            for key in submission_keys:
+                _submission_record_states.pop(key, None)
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except Exception as exc:
         logger.error("Selected batch submission failed: %s", exc, exc_info=True)
         with _submission_lock:
-            _submission_states[fingerprint] = "uncertain"
+            for key in submission_keys:
+                _submission_record_states[key] = ("uncertain", time.monotonic())
         raise HTTPException(status_code=500, detail="Submission outcome is uncertain; reload and verify before retrying.") from exc
 
     with _submission_lock:
-        _submission_states[fingerprint] = "submitted" if result.success else "uncertain"
+        for key in submission_keys:
+            if result.success:
+                _submission_record_states[key] = ("submitted", time.monotonic())
+            else:
+                _submission_record_states.pop(key, None)
+    if not result.success:
+        raise HTTPException(
+            status_code=502,
+            detail=result.message or "The Oracle procedure did not confirm a successful submission.",
+        )
     return {
         "success": result.success,
         "message": result.message,
@@ -366,6 +430,72 @@ def tag_refinance_batch(request: TagBatchRequest) -> dict[str, str | bool]:
         }
     finally:
         _tag_batch_lock.release()
+
+
+@app.post("/api/refinance/tag-reference", tags=["refinance"])
+def tag_refinance_reference(request: TagReferenceRequest) -> dict[str, str | int | bool]:
+    batch_no = request.batch_no.strip()
+    reference_no = request.reference_no.strip()
+    if not batch_no:
+        raise HTTPException(status_code=422, detail="Batch No. is required.")
+    if not reference_no:
+        raise HTTPException(status_code=422, detail="Reference No. is required.")
+    if not ALLOW_BATCH_SUBMISSION:
+        raise HTTPException(
+            status_code=403,
+            detail="Reference number updates are disabled.",
+        )
+    if not _tag_reference_lock.acquire(blocking=False):
+        raise HTTPException(
+            status_code=409,
+            detail="A reference number update is already in progress. Please wait.",
+        )
+
+    try:
+        try:
+            rows_updated = tag_batch_reference(batch_no, reference_no)
+        except DatabaseError as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except Exception as exc:
+            logger.error("Reference number update failed: %s", exc, exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail="Unable to assign the reference number. Please contact the system administrator.",
+            ) from exc
+
+        if rows_updated <= 0:
+            raise HTTPException(
+                status_code=404,
+                detail="No records found for the specified Batch No. Please verify the batch number and try again.",
+            )
+        return {
+            "success": True,
+            "batch_no": batch_no,
+            "reference_no": reference_no,
+            "records_updated": rows_updated,
+            "message": (
+                f"Reference No. {reference_no} has been successfully assigned to "
+                f"Batch No. {batch_no}. Total records updated: {rows_updated}."
+            ),
+        }
+    finally:
+        _tag_reference_lock.release()
+
+
+@app.get("/api/refinance/tag-reference/batches", tags=["refinance"])
+def refinance_reference_batches() -> dict[str, list[str]]:
+    try:
+        batch_numbers = get_refinance_batch_numbers()
+    except DatabaseError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.error("Reference-tagging batch list retrieval failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to retrieve batch numbers. Please try again or contact the system administrator.",
+        ) from exc
+
+    return {"batch_numbers": batch_numbers}
 
 
 @app.post("/api/refinance/pending-batches", tags=["refinance"])

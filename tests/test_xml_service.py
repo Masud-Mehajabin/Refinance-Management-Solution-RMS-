@@ -14,7 +14,12 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from services.xml_service import generate_xml, validate_xml, _format_value
+from services.xml_service import (
+    generate_xml,
+    missing_required_xml_values,
+    validate_xml,
+    _format_value,
+)
 from services.refinance_service import COLUMN_TO_XML_MAP
 
 
@@ -29,9 +34,12 @@ class TestFormatValue:
     def test_nan(self):
         assert _format_value(float("nan")) == ""
 
+    def test_pandas_na(self):
+        assert _format_value(pd.NA) == ""
+
     def test_datetime(self):
         dt = datetime(2024, 3, 15, 10, 30, 0)
-        assert _format_value(dt) == "15032024"
+        assert _format_value(dt) == "2024-03-15"
 
     def test_integer(self):
         assert _format_value(42) == "42"
@@ -64,6 +72,33 @@ class TestFormatValue:
 # ===================================================================
 
 class TestGenerateXml:
+    def test_existing_refinance_query_aliases_populate_xml_fields(self):
+        source = pd.DataFrame(
+            {
+                "ENTERPRISE_NAME": ["Enterprise"],
+                "BORROWER_FULL_NAME": ["Borrower"],
+                "ESTABLISHED_OWNERSHIP_STRUCTURE": ["Company"],
+                "SANCTION_AMOUNT": [4200],
+                "BRANCH_ID": ["0101"],
+                "ACCOUNT_NUMBER": ["000123"],
+            }
+        )
+
+        root = fromstring(generate_xml(source))
+        detail = root.find("TRANS_DETAILS")
+
+        assert detail.findtext("Paccount_title") == "Enterprise"
+        assert detail.findtext("Pborrower_name") == "Borrower"
+        assert detail.findtext("Pestablished_structure") == "Company"
+        assert detail.findtext("Ploan_amount") == "4200"
+
+    def test_missing_required_values_are_identified(self, sample_df):
+        source = sample_df.copy()
+        source["BORROWER_NID"] = ""
+        source["CL_STATUS"] = None
+
+        assert missing_required_xml_values(source) == ["PBorrower_NID", "Pcl_status"]
+
     def test_single_record(self, sample_df):
         xml = generate_xml(sample_df)
         root = fromstring(xml)
@@ -124,7 +159,7 @@ class TestGenerateXml:
         root = fromstring(xml)
         detail = root.find("TRANS_DETAILS")
         open_date = detail.find("Popen_date")
-        assert open_date.text == "15012024"
+        assert open_date.text == "2024-01-15"
 
     def test_each_record_has_the_same_ordered_fields_and_its_own_values(self, multi_row_df):
         root = fromstring(generate_xml(multi_row_df))

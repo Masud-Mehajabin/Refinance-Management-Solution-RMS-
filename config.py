@@ -37,8 +37,6 @@ ORACLE_DSN: str = os.getenv("ORACLE_DSN", "")
 # ---------------------------------------------------------------------------
 APP_USER: str = os.getenv("APP_USER", "SYSTEM")
 APP_ENV: str = os.getenv("APP_ENV", "development")
-APPROVER_USERNAME: str = os.getenv("APPROVER_USERNAME", "")
-APPROVER_PASSWORD: str = os.getenv("APPROVER_PASSWORD", "")
 ALLOW_BATCH_SUBMISSION: bool = os.getenv("ALLOW_BATCH_SUBMISSION", "false").lower() == "true"
 
 

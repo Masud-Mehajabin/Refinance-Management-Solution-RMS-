@@ -8,6 +8,7 @@ structured response objects. Never modifies the existing PL/SQL packages.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional
@@ -18,6 +19,10 @@ import pandas as pd
 from database import managed_connection, DatabaseError
 
 logger = logging.getLogger("refinance_app.services.refinance")
+
+
+class SubmissionOutcomeUncertainError(DatabaseError):
+    """Raised when a commit failure makes the submission outcome uncertain."""
 
 
 # ---------------------------------------------------------------------------
@@ -82,10 +87,27 @@ COLUMN_TO_XML_MAP: dict[str, str] = {
     "REPAY_DATE":             "Prepay_date",
 }
 
+XML_SOURCE_ALIASES: dict[str, tuple[str, ...]] = {
+    "ACCOUNT_TITLE": ("ENTERPRISE_NAME",),
+    "BORROWER_NAME": ("BORROWER_FULL_NAME",),
+    "ESTABLISHED_STRUCTURE": ("ESTABLISHED_OWNERSHIP_STRUCTURE",),
+    "LOAN_AMOUNT": ("SANCTION_AMOUNT",),
+}
+
 
 def get_xml_field_names() -> list[str]:
     """Return the ordered list of XML element names for TRANS_DETAILS."""
     return list(COLUMN_TO_XML_MAP.values())
+
+
+def _oracle_error_code(exc: Exception) -> str | None:
+    for argument in exc.args:
+        code = getattr(argument, "code", None)
+        if isinstance(code, int) and code:
+            return f"ORA-{abs(code):05d}"
+
+    match = re.search(r"\bORA-\d{5}\b", str(exc))
+    return match.group(0) if match else None
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +317,38 @@ def get_batch_details(batch_no: str | None = None) -> pd.DataFrame:
         raise DatabaseError(
             "Unable to retrieve batch details. Please try again or contact the system administrator."
         ) from exc
+
+
+def get_refinance_batch_numbers() -> list[str]:
+    """Return distinct batch numbers currently present in the refinance master table."""
+    try:
+        with managed_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT DISTINCT t.BATCH_NO
+                      FROM MGBL_REFINANCE_MASTER t
+                     WHERE t.BATCH_NO IS NOT NULL
+                     ORDER BY t.BATCH_NO
+                    """
+                )
+                return [
+                    str(row[0]).strip()
+                    for row in cur.fetchall()
+                    if row[0] is not None and str(row[0]).strip()
+                ]
+    except DatabaseError:
+        raise
+    except oracledb.Error as exc:
+        logger.error("Failed to retrieve refinance batch numbers: %s", exc, exc_info=True)
+        raise DatabaseError(
+            "Unable to retrieve batch numbers. Please try again or contact the system administrator."
+        ) from exc
+    except Exception as exc:
+        logger.error("Unexpected batch-number retrieval error: %s", exc, exc_info=True)
+        raise DatabaseError(
+            "Unable to retrieve batch numbers. Please try again or contact the system administrator."
+        ) from exc
     except Exception as exc:
         logger.error("Unexpected batch detail retrieval error: %s", exc, exc_info=True)
         raise DatabaseError(
@@ -312,17 +366,27 @@ def validate_column_mapping(df: pd.DataFrame) -> tuple[list[str], list[str]]:
         mapped_columns  — source columns that exist in both df and the map.
         missing_columns — source columns expected by the map but absent in df.
     """
-    expected = set(COLUMN_TO_XML_MAP.keys())
     actual = set(c.upper() for c in df.columns)
 
-    mapped = sorted(expected & actual)
-    missing = sorted(expected - actual)
+    available = {
+        source
+        for expected in COLUMN_TO_XML_MAP
+        for source in (expected, *XML_SOURCE_ALIASES.get(expected, ()))
+        if source in actual
+    }
+    mapped = sorted(
+        expected
+        for expected in COLUMN_TO_XML_MAP
+        if expected in actual
+        or any(alias in actual for alias in XML_SOURCE_ALIASES.get(expected, ()))
+    )
+    missing = sorted(set(COLUMN_TO_XML_MAP) - set(mapped))
 
     if missing:
         logger.warning("Missing cursor columns for XML mapping: %s", missing)
 
     # Also report any extra columns in the cursor not in the map
-    extra = sorted(actual - expected)
+    extra = sorted(actual - available)
     if extra:
         logger.info("Extra cursor columns not in XML map: %s", extra)
 
@@ -408,12 +472,59 @@ def generate_batch_number(
         ) from exc
 
 
+def tag_batch_reference(batch_no: str, reference_no: str) -> int:
+    """Assign a Bangladesh Bank reference number to every row in a batch."""
+    try:
+        with managed_connection() as conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE MGBL_REFINANCE_MASTER t
+                           SET t.BB_REFERENCE_ID = :P_REFERENCE_NO
+                         WHERE t.BATCH_NO = :P_BATCH_NO
+                        """,
+                        {
+                            "P_REFERENCE_NO": reference_no,
+                            "P_BATCH_NO": batch_no,
+                        },
+                    )
+                    rows_updated = cur.rowcount
+
+                if rows_updated > 0:
+                    conn.commit()
+                    logger.info(
+                        "Assigned reference number to %d refinance record(s) for batch %s.",
+                        rows_updated,
+                        batch_no,
+                    )
+                else:
+                    conn.rollback()
+                return rows_updated
+            except Exception:
+                conn.rollback()
+                raise
+    except DatabaseError:
+        raise
+    except oracledb.Error as exc:
+        logger.error("Reference tagging failed for batch %s: %s", batch_no, exc, exc_info=True)
+        raise DatabaseError(
+            "Unable to assign the reference number due to a database error. "
+            "Please try again or contact the system administrator."
+        ) from exc
+    except Exception as exc:
+        logger.error("Unexpected reference tagging error for batch %s: %s", batch_no, exc, exc_info=True)
+        raise DatabaseError(
+            "Unable to assign the reference number. Please try again or contact the system administrator."
+        ) from exc
+
+
 def submit_refinance_batch(
     xml_data: str,
-    make_by: str,
-    make_date: datetime,
-    authorize_by: str,
-    authorize_date: datetime,
+    make_by: str | None,
+    make_date: datetime | None,
+    authorize_by: str | None,
+    authorize_date: datetime | None,
     record_count: int = 0,
 ) -> SubmissionResult:
     """
@@ -423,14 +534,14 @@ def submit_refinance_batch(
     ----------
     xml_data : str
         The complete XML CLOB to submit.
-    make_by : str
-        The maker user identity.
-    make_date : datetime
-        Maker timestamp.
-    authorize_by : str
-        Authorizer identity.
-    authorize_date : datetime
-        Authorization timestamp.
+    make_by : str | None
+        Optional maker user identity.
+    make_date : datetime | None
+        Optional maker timestamp.
+    authorize_by : str | None
+        Optional authorizer identity.
+    authorize_date : datetime | None
+        Optional authorization timestamp.
     record_count : int
         Number of records in the submission (for logging / display).
 
@@ -448,11 +559,10 @@ def submit_refinance_batch(
 
     Transaction Behavior
     --------------------
-    The existing procedure's commit/rollback behavior has not been inspected.
-    This function does NOT issue an explicit COMMIT or ROLLBACK to avoid
-    conflicting with the procedure's own transaction management.
-    If inspection reveals the procedure does not commit, an explicit COMMIT
-    should be added here after verification.
+    Commit only when the procedure returns a batch number and a non-error
+    status message. Roll back missing/failed outputs and raised exceptions.
+    The PL/SQL source is not part of this project, so this cannot undo work
+    that the procedure itself may already have committed.
     """
     if not xml_data or not xml_data.strip():
         return SubmissionResult(
@@ -463,72 +573,142 @@ def submit_refinance_batch(
 
     try:
         with managed_connection() as conn:
-            with conn.cursor() as cur:
-                # OUT bind variables
-                p_message = cur.var(oracledb.DB_TYPE_NVARCHAR, 4000)
-                p_batch_no = cur.var(oracledb.DB_TYPE_NVARCHAR, 100)
+            try:
+                with conn.cursor() as cur:
+                    p_xml_data = cur.var(oracledb.DB_TYPE_CLOB)
+                    p_xml_data.setvalue(0, xml_data)
+                    p_message = cur.var(oracledb.DB_TYPE_NVARCHAR, 4000)
+                    p_batch_no = cur.var(oracledb.DB_TYPE_NVARCHAR, 100)
 
-                cur.callproc(
-                    "PKG_MGBL_REFINANCE.REFINANCE_MASTER_INFO_I",
-                    [
-                        xml_data,       # Pxml_data   IN CLOB
-                        make_by,        # Pmake_by    IN NVARCHAR2
-                        make_date,      # Pmake_date  IN DATE
-                        authorize_by,   # Pauthorize_by   IN NVARCHAR2
-                        authorize_date, # Pauthorize_date IN DATE
-                        p_message,      # Pmessage    OUT NVARCHAR2
-                        p_batch_no,     # PBatch_NO   OUT NVARCHAR2
-                    ],
+                    cur.execute(
+                        """
+                        BEGIN
+                            pkg_mgbl_refinance.refinance_master_info_i(
+                                pxml_data       => :pxml_data,
+                                pmake_by        => :pmake_by,
+                                pmake_date      => :pmake_date,
+                                pauthorize_by   => :pauthorize_by,
+                                pauthorize_date => :pauthorize_date,
+                                pmessage        => :pmessage,
+                                pbatch_no       => :pbatch_no
+                            );
+                        END;
+                        """,
+                        {
+                            "pxml_data": p_xml_data,
+                            "pmake_by": make_by,
+                            "pmake_date": make_date,
+                            "pauthorize_by": authorize_by,
+                            "pauthorize_date": authorize_date,
+                            "pmessage": p_message,
+                            "pbatch_no": p_batch_no,
+                        },
+                    )
+
+                    message = str(p_message.getvalue() or "").strip()
+                    batch_value = p_batch_no.getvalue()
+                    batch = str(batch_value).strip() if batch_value is not None else ""
+
+                count_match = re.search(
+                    r"^000\s*-\s*Successfully inserted\s+(\d+)\s+record\(s\)",
+                    message,
+                    re.IGNORECASE,
                 )
-
-                msg = p_message.getvalue() or ""
-                batch = p_batch_no.getvalue() or ""
-
-                logger.info(
-                    "Procedure returned — message: %s, batch: %s",
-                    msg, batch,
+                returned_count = int(count_match.group(1)) if count_match else 0
+                is_success = (
+                    bool(batch)
+                    and count_match is not None
+                    and returned_count == record_count
                 )
+                if not is_success:
+                    conn.rollback()
+                    logger.warning(
+                        "Refinance submission was not confirmed by Oracle (%d records).",
+                        record_count,
+                    )
+                    return SubmissionResult(
+                        success=False,
+                        message=message or "The Oracle procedure did not confirm a successful submission.",
+                        batch_number=batch or None,
+                        timestamp=datetime.now(),
+                        record_count=returned_count,
+                    )
 
-                # Determine success from the procedure's own output.
-                # Convention: a non-empty batch number with a non-error
-                # message indicates success.  Adjust after inspecting the
-                # actual procedure contract.
-                is_success = bool(batch) and "error" not in msg.lower()
+            except Exception as exc:
+                try:
+                    conn.rollback()
+                except Exception as rollback_exc:
+                    logger.error(
+                        "Rollback failed after refinance procedure error: %s",
+                        rollback_exc,
+                        exc_info=True,
+                    )
+                    raise SubmissionOutcomeUncertainError(
+                        "The submission failed and its rollback could not be confirmed. "
+                        "Verify the batch status before retrying."
+                    ) from rollback_exc
+                oracle_code = _oracle_error_code(exc)
+                raise DatabaseError(
+                    "Oracle rejected the refinance submission; the transaction was rolled back. "
+                    + (
+                        f"Oracle error code: {oracle_code}. "
+                        if oracle_code
+                        else ""
+                    )
+                    + "Check the application log for details, correct the input, and retry."
+                ) from exc
 
-                return SubmissionResult(
-                    success=is_success,
-                    message=msg,
-                    batch_number=batch if batch else None,
-                    timestamp=datetime.now(),
-                    record_count=record_count,
-                )
+            try:
+                conn.commit()
+            except Exception as exc:
+                try:
+                    conn.rollback()
+                except Exception as rollback_exc:
+                    logger.error(
+                        "Rollback failed after refinance commit error: %s",
+                        rollback_exc,
+                        exc_info=True,
+                    )
+                logger.error("Refinance submission commit outcome is uncertain: %s", exc, exc_info=True)
+                raise SubmissionOutcomeUncertainError(
+                    "The database commit outcome is uncertain. Verify the batch status before retrying."
+                ) from exc
 
+            logger.info(
+                "Refinance submission confirmed by Oracle (%d records).",
+                record_count,
+            )
+            return SubmissionResult(
+                success=True,
+                message=message,
+                batch_number=batch,
+                timestamp=datetime.now(),
+                record_count=returned_count,
+            )
+
+    except SubmissionOutcomeUncertainError:
+        raise
     except DatabaseError:
         raise
     except oracledb.Error as exc:
         logger.error(
             "Procedure REFINANCE_MASTER_INFO_I failed: %s", exc, exc_info=True
         )
-        return SubmissionResult(
-            success=False,
-            message=(
-                "Batch submission failed due to a database error. "
-                "The batch may NOT have been created. "
-                "Please check before retrying."
-            ),
-            timestamp=datetime.now(),
-            record_count=record_count,
-        )
+        oracle_code = _oracle_error_code(exc)
+        raise DatabaseError(
+            "Batch submission failed due to a database error. "
+            + (
+                f"Oracle error code: {oracle_code}. "
+                if oracle_code
+                else ""
+            )
+            + "Please verify the batch status before retrying."
+        ) from exc
     except Exception as exc:
         logger.error(
             "Unexpected error during batch submission: %s", exc, exc_info=True
         )
-        return SubmissionResult(
-            success=False,
-            message=(
-                "An unexpected error occurred during submission. "
-                "Outcome is uncertain — please verify before retrying."
-            ),
-            timestamp=datetime.now(),
-            record_count=record_count,
-        )
+        raise DatabaseError(
+            "An unexpected error occurred during submission. "
+            "Please verify the batch status before retrying."
+        ) from exc

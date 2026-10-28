@@ -18,9 +18,20 @@ from xml.etree.ElementTree import Element, SubElement, indent, tostring
 
 import pandas as pd
 
-from services.refinance_service import COLUMN_TO_XML_MAP
+from services.refinance_service import COLUMN_TO_XML_MAP, XML_SOURCE_ALIASES
 
 logger = logging.getLogger("refinance_app.services.xml_service")
+
+REQUIRED_XML_FIELDS = (
+    "BRANCH_ID",
+    "ACCOUNT_NUMBER",
+    "ACCOUNT_TITLE",
+    "BORROWER_NID",
+    "LOAN_AMOUNT",
+    "INTEREST_RATE",
+    "OPEN_DATE",
+    "CL_STATUS",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -33,21 +44,21 @@ def _format_value(value: Any) -> str:
 
     Rules:
     - None / NaN  → empty string (the element is still present)
-    - datetime    → DDMMYYYY
-    - date        → DDMMYYYY
+    - datetime    → YYYY-MM-DD
+    - date        → YYYY-MM-DD
     - Decimal     → plain decimal string (no scientific notation)
     - float       → fixed-point with up to 2 decimal places (trailing zeros stripped)
     - int         → plain integer string
     - str         → stripped string (ElementTree handles XML escaping)
     """
-    if value is None:
-        return ""
-    if isinstance(value, float) and pd.isna(value):
+    if value is None or (
+        pd.api.types.is_scalar(value) and pd.isna(value)
+    ):
         return ""
     if isinstance(value, datetime):
-        return value.strftime("%d%m%Y")
+        return value.strftime("%Y-%m-%d")
     if isinstance(value, date):
-        return value.strftime("%d%m%Y")
+        return value.strftime("%Y-%m-%d")
     if isinstance(value, Decimal):
         return str(value)
     if isinstance(value, float):
@@ -90,7 +101,10 @@ def generate_xml(df: pd.DataFrame) -> str:
     col_upper = {c.upper(): c for c in df.columns}
 
     missing_sources = [
-        src_upper for src_upper in COLUMN_TO_XML_MAP if src_upper not in col_upper
+        src_upper
+        for src_upper in COLUMN_TO_XML_MAP
+        if src_upper not in col_upper
+        and not any(alias in col_upper for alias in XML_SOURCE_ALIASES.get(src_upper, ()))
     ]
 
     if missing_sources:
@@ -113,6 +127,15 @@ def generate_xml(df: pd.DataFrame) -> str:
         for src_upper, xml_name in COLUMN_TO_XML_MAP.items():
             elem = SubElement(detail, xml_name)
             actual_col = col_upper.get(src_upper)
+            if actual_col is None:
+                actual_col = next(
+                    (
+                        col_upper[alias]
+                        for alias in XML_SOURCE_ALIASES.get(src_upper, ())
+                        if alias in col_upper
+                    ),
+                    None,
+                )
             elem.text = _format_value(row.get(actual_col)) if actual_col else ""
 
     indent(root, space="    ")
@@ -124,6 +147,34 @@ def generate_xml(df: pd.DataFrame) -> str:
         len(df), len(xml_str),
     )
     return xml_str
+
+
+def missing_required_xml_values(df: pd.DataFrame) -> list[str]:
+    """Return required target fields that are blank for one or more records."""
+    columns = {str(column).upper(): column for column in df.columns}
+    missing: list[str] = []
+
+    for source_name in REQUIRED_XML_FIELDS:
+        actual_column = columns.get(source_name)
+        if actual_column is None:
+            actual_column = next(
+                (
+                    columns[alias]
+                    for alias in XML_SOURCE_ALIASES.get(source_name, ())
+                    if alias in columns
+                ),
+                None,
+            )
+        if actual_column is None:
+            missing.append(COLUMN_TO_XML_MAP[source_name])
+            continue
+
+        values = df[actual_column]
+        blank_values = values.isna() | values.astype("string").str.strip().eq("").fillna(False)
+        if blank_values.any():
+            missing.append(COLUMN_TO_XML_MAP[source_name])
+
+    return missing
 
 
 def validate_xml(xml_str: str) -> tuple[bool, str]:

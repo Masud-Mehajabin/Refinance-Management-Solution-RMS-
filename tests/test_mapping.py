@@ -78,6 +78,19 @@ class TestValidateColumnMapping:
         assert "BRANCH_ID" in mapped
         assert "ACCOUNT_NUMBER" in mapped
 
+    def test_existing_refinance_query_aliases_are_recognized(self):
+        df = pd.DataFrame(
+            {
+                "ENTERPRISE_NAME": ["Account"],
+                "BORROWER_FULL_NAME": ["Borrower"],
+                "ESTABLISHED_OWNERSHIP_STRUCTURE": ["Company"],
+                "SANCTION_AMOUNT": [1000],
+            }
+        )
+        mapped, missing = validate_column_mapping(df)
+        assert {"ACCOUNT_TITLE", "BORROWER_NAME", "ESTABLISHED_STRUCTURE", "LOAN_AMOUNT"} <= set(mapped)
+        assert not {"ACCOUNT_TITLE", "BORROWER_NAME", "ESTABLISHED_STRUCTURE", "LOAN_AMOUNT"} & set(missing)
+
     def test_empty_df(self, empty_df):
         mapped, missing = validate_column_mapping(empty_df)
         # Columns are present even though rows are empty
